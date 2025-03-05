@@ -230,6 +230,37 @@ class CastedLinear(nn.Linear):
         else:
             return F.linear(x, self.weight.type_as(x))
 
+
+class CastedBiLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
+        super().__init__()
+        self.use_fp8 = use_fp8
+        self.x_s = x_s
+        self.w_s = w_s
+        self.grad_s = grad_s
+
+        self.w1 = nn.Linear(in_features, out_features, bias=False)
+        self.w2 = nn.Linear(in_features, out_features, bias=False)
+
+    def reset_parameters(self) -> None:
+        std = 0.5 * (self.in_features ** -0.5)  # 0.5 is a bit better than the default 1/sqrt(3)
+        bound = (3 ** 0.5) * std
+        with torch.no_grad():
+            self.w1.weight.uniform_(-bound, bound)
+            self.w2.weight.uniform_(-bound, bound)
+
+    def forward(self, x: Tensor, y: Tensor):
+        if self.use_fp8 and self.training:
+            _x = x.flatten(0, -2)
+            _y = y.flatten(0, -2)
+            out1: Tensor = torch.ops.nanogpt.mm(_x, self.w1.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
+            out2: Tensor = torch.ops.nanogpt.mm(_y, self.w2.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
+            return out1 * out2
+        else:
+            out1: Tensor = F.linear(x, self.w1.weight)
+            out2: Tensor = F.linear(y, self.w2.weight)
+            return out1 * out2
+
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
         super().__init__()
@@ -262,7 +293,7 @@ class CausalSelfAttention(nn.Module):
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(head_dim, max_seq_len)
-        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj = CastedBiLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
@@ -279,7 +310,7 @@ class CausalSelfAttention(nn.Module):
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=0.12).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = self.c_proj(y)
+        y = self.c_proj(y, x)
         return y
 
 class MLP(nn.Module):
